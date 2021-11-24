@@ -89,7 +89,7 @@
         (let ((expire (read-expire p))
               (subjects (unique (read-subjects p) fqdn<? equal?)))
           (close-pipe p)
-          (if (or (null? subject)
+          (if (or (null? subjects)
                   (not (time? expire)))
             (begin (dump "WARNING: ignoring due to lack of data: ~a: ~s ~s~%"
                          cert expire subjects)
