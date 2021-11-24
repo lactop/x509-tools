@@ -40,23 +40,23 @@
 (define (string->fqdn s) (reverse (string-split s #\.)))
 (define (fqdn->string n) (string-join (reverse n) "."))
 
-; Сравнение fqdn (в заданном выше смысле). Возвращает #:L #:E #:G
+; Сравнение fqdn (в заданном выше смысле). Возвращает #:less #:equal #:greater
 (define (fqdn-compare s t)
   ; (1) Если t пустой адрес, то s ≥ t, разбираем случаи.
   ; (2) Если t не пустой, то пустой s < t.
   ; (3) Сравниваем первые компоненты имён. Если (car s) < (car t), возвращаем
   ; #t. Если (car s) > (car t), возвращаем #f. В случае (car s) = (car t)
   ; сравниваем оставшиеся хвосты.  
-  (cond ((null? t) (if (null? s) #:E #:G))
-        ((null? s) #:L)
+  (cond ((null? t) (if (null? s) #:equal #:greater))
+        ((null? s) #:less)
         (else (string-compare (car s) (car t)
-                              (const #:L)
+                              (const #:less)
                               (lambda A (fqdn-compare (cdr s) (cdr t)))
-                              (const #:G)))))
+                              (const #:greater)))))
 
-(define (fqdn>? s t) (eqv? #:G (fqdn-compare s t)))
-(define (fqdn=? s t) (eqv? #:E (fqdn-compare s t)))
-(define (fqdn<? s t) (eqv? #:L (fqdn-compare s t)))
+(define (fqdn>? s t) (eqv? #:greater (fqdn-compare s t)))
+(define (fqdn=? s t) (eqv? #:equal (fqdn-compare s t)))
+(define (fqdn<? s t) (eqv? #:less (fqdn-compare s t)))
 
 (define (read-subjects p)
   (let loop ((v (read-line p))
@@ -146,17 +146,16 @@
   (unique keys
           (lambda (k l)
             (case (fqdn-compare (subject k) (subject l))
-              ((#:L) #f)
-              ((#:G) #t)
-              ((#:E) (time>? (expire k) (expire l)))))
+              ((#:less) #f)
+              ((#:greater) #t)
+              ((#:equal) (time>? (expire k) (expire l)))))
           (lambda (k l)
             (and (fqdn=? (subject k) (subject l))
                  (begin (dump "WARNING: ignoring outdated: ~a: ~a: ~a~%"
                               (key l)
                               (subject-url l)
                               (expiration-date l))
-                        #t)))
-          ))
+                        #t)))))
 
 (define key-directory
   (let* ((cl (command-line))
