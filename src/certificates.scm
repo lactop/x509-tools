@@ -6,6 +6,9 @@
              (srfi srfi-1)
              (srfi srfi-19))
 
+; OpenSSL не учитывает текущую locale (место действия). Приспосабливаемся
+(setlocale LC_ALL "en_US.UTF-8")
+
 (define dump
   (let ((p (current-error-port))
         (m (make-mutex)))
@@ -50,26 +53,28 @@
     l))
 
 (define (unique L less? same?)
-    (let ((S (sort L less?)))
-      (if (null? S)
-        '()
-        (fold (lambda (x R) (if (same? (car R) x) R (cons x R)))
-              (list (car S))
-              (cdr S)))))
+  (let ((S (sort L less?)))
+    (if (null? S)
+      '()
+      (fold (lambda (x R) (if (same? (car R) x) R (cons x R)))
+            (list (car S))
+            (cdr S)))))
 
 (define key car)
 (define expire cadr)
 (define subject cddr)
 
 (define (certificate-subjects text)
-  (fold (lambda (s R)
-          (fold-matches fqdn-re s R
-                        (lambda (m M)
-                          (cons (string->fqdn (match:substring m)) M))))
-        '()
-        text))
+  (unique (fold (lambda (s R)
+                  (fold-matches fqdn-re s R
+                                (lambda (m M)
+                                  (cons (string->fqdn (match:substring m)) M))))
+                '()
+                text)
+          fqdn<?
+          fqdn=?))
 
-; (define (read-key p)
+; (define (read-subjects p)
 ;   (let loop ((v (read-line p))
 ;              (R '()))
 ;     (append-map (fold-matches fqdn-re s 
@@ -125,20 +130,18 @@
 (define read-key-directory
   (let ((pass (lambda (path stat result) result))
 
-        (fail
-          (lambda (path stat errno result)
-            (dump "WARNING: ~a: ~a~%" path (strerror errno))
-            result))
+        (fail (lambda (path stat errno result)
+                (warn "~a: ~a~%" path (strerror errno))
+                result))
 
-        (leaf
-          (lambda(path stat result)
-            (cond
-              ((and (eq? 'regular (stat:type stat))
-                    (string-suffix? ".pem" path))
-               (cons path result))
+        (leaf (lambda(path stat result)
+                (cond
+                  ((and (eq? 'regular (stat:type stat))
+                        (string-suffix? ".pem" path))
+                   (cons path result))
 
-              (else (dump "WARNING: ~a: not a regular .pem file~%" path)
-                    result)))))
+                  (else (warn "~a: not a regular .pem file~%" path)
+                        result)))))
     (lambda (directory)
       (let ((pems (file-system-fold
                     ; Заходить директорию? 
@@ -223,6 +226,9 @@
                     (exit 1)))))))
 
 (define key-records (only-fresh (read-key-directory key-directory)))
+
+; (for-each write-line key-records)
+; (exit 0)
 
 ; По идее, сравнения по указателям должны работать.
 (let ((len (length key-records)))
