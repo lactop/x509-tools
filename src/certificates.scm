@@ -13,25 +13,10 @@
       (with-mutex m (apply format p fmt args)) (force-output p))))
 
 (define (false? v) (and (boolean? v) (not v)))
+(define (populated? l) (positive? (length l)))
 
-; Беда: Guile не умеет понимать строковые обозначения временных зон. Поэтому
-; надо извлечь обозначение временной зоны, убедиться что это GMT или UTC, и
-; заменить его на +0000. 
-(define (excavate-date s)
-  ; (dump "DATE: ~s~%" s)
-  (let ((l (string-length s)))
-    (and (< 3 l)
-       (let ((zone (substring/read-only s (- l 3)))
-             (date (substring/read-only s 0 (- l 3))))
-         (if (or (string=? "GMT" zone)
-                 (string=? "UTC" zone))
-           (string-append date "+0000")
-           (begin (dump "WARNING: Unknown time-zone: ~s~%" s) 
-                  #f))))))
-
-(define (read-expire p)
-  (let ((l (excavate-date (read-line p))))
-    (and l (date->time-utc (string->date l "notAfter=~b~d~H:~M:~S~Y~z")))))
+; Дурная функция, потому что, например, (empty? 1) ⇒ #f
+; (define (empty? v) (and (list? v) (null? v)))
 
 (define fqdn-re (make-regexp "[0-9a-z-]+(\\.[0-9a-z-]+)+"))
 
@@ -42,11 +27,11 @@
 
 ; Сравнение fqdn (в заданном выше смысле). Возвращает #:less #:equal #:greater
 (define (fqdn-compare s t)
-  ; (1) Если t пустой адрес, то s ≥ t, разбираем случаи.
-  ; (2) Если t не пустой, то пустой s < t.
-  ; (3) Сравниваем первые компоненты имён. Если (car s) < (car t), возвращаем
-  ; #t. Если (car s) > (car t), возвращаем #f. В случае (car s) = (car t)
-  ; сравниваем оставшиеся хвосты.  
+  ; 1. Если t пустой адрес, то s ≥ t, разбираем случаи.
+  ; 2. Если t не пустой, то пустой s < t.
+  ; 3. Сравниваем первые компоненты имён. Если (car s) < (car t), возвращаем
+  ; #:less. Если (car s) > (car t), возвращаем #:greater. В случае (car s) =
+  ; (car t) сравниваем оставшиеся хвосты.  
   (cond ((null? t) (if (null? s) #:equal #:greater))
         ((null? s) #:less)
         (else (string-compare (car s) (car t)
@@ -58,13 +43,11 @@
 (define (fqdn=? s t) (eqv? #:equal (fqdn-compare s t)))
 (define (fqdn<? s t) (eqv? #:less (fqdn-compare s t)))
 
-(define (read-subjects p)
-  (let loop ((v (read-line p))
-             (R '()))
-    (if (eof-object? v)
-      (map (compose string->fqdn match:substring) R)
-      (loop (read-line p)
-            (append-reverse (list-matches fqdn-re v) R)))))
+(define (pipe-lines . cmd)
+  (let* ((p (apply open-pipe* OPEN_READ cmd))
+         (l (unfold eof-object? identity (λ x (read-line p)) (read-line p))))
+    (close-pipe p)
+    l))
 
 (define (unique L less? same?)
     (let ((S (sort L less?)))
@@ -77,27 +60,67 @@
 (define key car)
 (define expire cadr)
 (define subject cddr)
+
+(define (certificate-subjects text)
+  (fold (lambda (s R)
+          (fold-matches fqdn-re s R
+                        (lambda (m M)
+                          (cons (string->fqdn (match:substring m)) M))))
+        '()
+        text))
+
+; (define (read-key p)
+;   (let loop ((v (read-line p))
+;              (R '()))
+;     (append-map (fold-matches fqdn-re s 
+;                               compose string->fqdn
+;                               match:substring
+;                               (lambda (s) (list-matches fqdn-re s))))
+;     (if (eof-object? v)
+;       (map (compose string->fqdn match:substring) R)
+;       (loop (read-line p)
+;             (append-reverse (list-matches fqdn-re v) R)))))
+
+; Вспомогательные процедуры вывода сообщений об ошибках. Возвращают значения,
+; примерно соответствующие необходимой логике программы.
+
+(define (warn fmt . args) (apply dump (string-append "WARNING: " fmt) args) #f)
+(define (ignore fmt . args) (apply dump (string-append "IGNORING: " fmt) args) '())
+ 
+; Беда: Guile не умеет понимать строковые обозначения временных зон. Поэтому
+; надо извлечь обозначение временной зоны, убедиться что это GMT или UTC, и
+; заменить его на +0000. Ожидается, что зоны обозначены словом из заглавных
+; букв и записаны в конце.
+
+(define zone-re (make-regexp "[A-Z]+$"))
+
+(define (fix-timezone s)
+  (let ((m (regexp-exec zone-re s)))
+    (if (and (regexp-match? m)
+             (member (match:substring m) '("GMT" "UTC") string=?))
+      (string-append (match:prefix m) "+0000")
+      (warn "Unexpected timezone: ~s~%" s))))
+
+(define (expiration-time s)
+  (let ((l (fix-timezone s)))
+    (and l (date->time-utc (string->date l "notAfter=~b~d~H:~M:~S~Y~z"))))) 
  
 (define (read-key cert)
   (catch 
     #t
     (lambda ()
-      (let ((p (open-pipe* OPEN_READ "openssl" "x509" "-noout" "-in" cert
-                           "-enddate"
-                           "-subject"
-                           "-ext" "subjectAltName")))
-        (let ((expire (read-expire p))
-              (subjects (unique (read-subjects p) fqdn<? equal?)))
-          (close-pipe p)
-          (if (or (null? subjects)
-                  (not (time? expire)))
-            (begin (dump "WARNING: ignoring due to lack of data: ~a: ~s ~s~%"
-                         cert expire subjects)
-                   '())
-            (map (lambda (s) (cons cert (cons expire s))) subjects)))))
+      (let* ((L (pipe-lines "openssl" "x509" "-noout" "-in" cert
+                            "-enddate"
+                            "-subject"
+                            "-ext" "subjectAltName"))
+             (t (and (pair? L) (expiration-time (car L))))
+             (S (and (pair? L) (certificate-subjects (cdr L)))))
+        (if (and (time? t)
+                 (populated? S))
+          (map (lambda (s) (cons* cert t s)) S)
+          (ignore "lack of data: ~a: ~s ~s~%" cert t S))))
     (lambda err
-      (dump "WARNING: ignoring due to error: ~a: ~s~%" cert err)
-      '())))
+      (ignore "error: ~a: ~s~%" cert err))))
 
 (define read-key-directory
   (let ((pass (lambda (path stat result) result))
@@ -202,8 +225,11 @@
 (define key-records (only-fresh (read-key-directory key-directory)))
 
 ; По идее, сравнения по указателям должны работать.
-(when (eq? nginx-echo engine)
-  (format #t "server_names_hash_bucket_size ~a; "
-          (expt 2 (integer-length (length key-records)))))
+(let ((len (length key-records)))
+  (when (and (eq? nginx-echo engine)
+             (positive? len))
+    (format #t
+            "server_names_hash_bucket_size ~a; "
+            (expt 2 (integer-length len)))))
 
 (for-each engine key-records)
