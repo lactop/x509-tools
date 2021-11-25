@@ -74,18 +74,6 @@
           fqdn<?
           fqdn=?))
 
-; (define (read-subjects p)
-;   (let loop ((v (read-line p))
-;              (R '()))
-;     (append-map (fold-matches fqdn-re s 
-;                               compose string->fqdn
-;                               match:substring
-;                               (lambda (s) (list-matches fqdn-re s))))
-;     (if (eof-object? v)
-;       (map (compose string->fqdn match:substring) R)
-;       (loop (read-line p)
-;             (append-reverse (list-matches fqdn-re v) R)))))
-
 ; Вспомогательные процедуры вывода сообщений об ошибках. Возвращают значения,
 ; примерно соответствующие необходимой логике программы.
 
@@ -127,43 +115,42 @@
     (lambda err
       (ignore "error: ~a: ~s~%" cert err))))
 
-(define read-key-directory
+(define pem-vector
   (let ((pass (lambda (path stat result) result))
-
         (fail (lambda (path stat errno result)
                 (warn "~a: ~a~%" path (strerror errno))
                 result))
-
-        (leaf (lambda(path stat result)
-                (cond
-                  ((and (eq? 'regular (stat:type stat))
-                        (string-suffix? ".pem" path))
-                   (cons path result))
-
-                  (else (warn "~a: not a regular .pem file~%" path)
-                        result)))))
+        (leaf (lambda (path stat result)
+                (if (and (eq? 'regular (stat:type stat))
+                         (string-suffix? ".pem" path))
+                  (cons path result)
+                  (begin (warn "~a: not a regular .pem file~%" path)
+                         result)))))
     (lambda (directory)
-      (let ((pems (file-system-fold
-                    ; Заходить директорию? 
-                    (const #t)
+      (list->vector
+        (file-system-fold
+          ; Заходить директорию? 
+          (const #t)
 
-                    ; Обработка записей в директориях.
-                    leaf
+          ; Обработка записей в директориях.
+          leaf
 
-                    ; Действия на входе из неё, на выходе, при её пропуске.
-                    pass
-                    pass
-                    pass
+          ; Действия на входе из неё, на выходе, при её пропуске.
+          pass
+          pass
+          pass
 
-                    ; Обработка ошибок.
-                    fail
+          ; Обработка ошибок.
+          fail
 
-                    '()
-                    (canonicalize-path directory)
+          '()
+          (canonicalize-path directory)
 
-                    ; Проходить по символическим ссылкам.
-                    stat)))
-        (concatenate (par-map read-key pems))))))
+          ; Проходить по символическим ссылкам.
+          stat)))))
+
+(define (read-key-directory directory)
+  (concatenate (par-map read-key (vector->list (pem-vector directory)))))
 
 (define expiration-date (compose date->string time-utc->date expire))
 (define subject-url (compose fqdn->string subject))
@@ -177,7 +164,7 @@
               ((#:equal) (time>? (expire k) (expire l)))))
           (lambda (k l)
             (and (fqdn=? (subject k) (subject l))
-                 (begin (dump "WARNING: ignoring outdated: ~a: ~a: ~a~%"
+                 (begin (warn "ignoring outdated: ~a: ~a: ~a~%"
                               (key l)
                               (subject-url l)
                               (expiration-date l))
@@ -188,7 +175,6 @@
          (len (length cl))
          (path (or (and (= 2 len) (second cl))
                    (and (<= 3 len) (third cl)))))
-    ; (dump "PATH: ~s~%" path)
     (if (and path
              (absolute-file-name? path)
              (file-exists? path)
