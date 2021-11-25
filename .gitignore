@@ -1,0 +1,9 @@
+*
+
+!.gitignore
+
+!src
+!src/*.scm
+
+!txt
+!txt/*.txt

@@ -4,10 +4,13 @@
              (ice-9 ftw)
              (ice-9 threads)
              (srfi srfi-1)
+             (srfi srfi-11)
              (srfi srfi-19))
 
 ; OpenSSL не учитывает текущую locale (место действия). Приспосабливаемся
 (setlocale LC_ALL "en_US.UTF-8")
+
+; ПРОСТЫЕ ВСПОМОГАТЕЛЬНЫЕ ПРОЦЕДУРЫ
 
 (define dump
   (let ((p (current-error-port))
@@ -15,37 +18,16 @@
     (lambda (fmt . args)
       (with-mutex m (apply format p fmt args)) (force-output p))))
 
+; Вспомогательные процедуры вывода сообщений об ошибках. Возвращают значения,
+; примерно соответствующие необходимой логике программы.
+
+(define (warn fmt . args) (apply dump (string-append "WARNING: " fmt) args) #f)
+(define (ignore fmt . args) (apply dump (string-append "IGNORING: " fmt) args) '()) 
+
 (define (false? v) (and (boolean? v) (not v)))
 (define (populated? l) (positive? (length l)))
 
-; Дурная функция, потому что, например, (empty? 1) ⇒ #f
-; (define (empty? v) (and (list? v) (null? v)))
-
-(define fqdn-re (make-regexp "[0-9a-z-]+(\\.[0-9a-z-]+)+"))
-
-; Удобно для поиска общих доменов в адресах разбить их на последовательности
-; слов, которые в адресе разделяются точкой.
-(define (string->fqdn s) (reverse (string-split s #\.)))
-(define (fqdn->string n) (string-join (reverse n) "."))
-
-; Сравнение fqdn (в заданном выше смысле). Возвращает #:less #:equal #:greater
-(define (fqdn-compare s t)
-  ; 1. Если t пустой адрес, то s ≥ t, разбираем случаи.
-  ; 2. Если t не пустой, то пустой s < t.
-  ; 3. Сравниваем первые компоненты имён. Если (car s) < (car t), возвращаем
-  ; #:less. Если (car s) > (car t), возвращаем #:greater. В случае (car s) =
-  ; (car t) сравниваем оставшиеся хвосты.  
-  (cond ((null? t) (if (null? s) #:equal #:greater))
-        ((null? s) #:less)
-        (else (string-compare (car s) (car t)
-                              (const #:less)
-                              (lambda A (fqdn-compare (cdr s) (cdr t)))
-                              (const #:greater)))))
-
-(define (fqdn>? s t) (eqv? #:greater (fqdn-compare s t)))
-(define (fqdn=? s t) (eqv? #:equal (fqdn-compare s t)))
-(define (fqdn<? s t) (eqv? #:less (fqdn-compare s t)))
-
+; Список строк выданных на stdout запущенной cmd
 (define (pipe-lines . cmd)
   (let* ((p (apply open-pipe* OPEN_READ cmd))
          (l (unfold eof-object? identity (λ x (read-line p)) (read-line p))))
@@ -60,9 +42,35 @@
             (list (car S))
             (cdr S)))))
 
-(define key car)
-(define expire cadr)
-(define subject cddr)
+; ПРОЦЕДУРЫ ДЛЯ РАБОТЫ С FQDN ВО ВНУТРЕННЕМ ФОРМАТЕ
+
+; Удобно для поиска общих доменов в адресах разбить их на последовательности
+; слов, которые в адресе разделяются точкой.
+(define (string->fqdn s) (reverse (string-split s #\.)))
+(define (fqdn->string n) (string-join (reverse n) ".")) 
+
+(define fqdn-re (make-regexp "[0-9a-z-]+(\\.[0-9a-z-]+)+"))
+
+; Сравнение fqdn (в заданном выше смысле). Возвращает #:less #:equal #:greater
+(define (fqdn-compare s t)
+  ; 1. Если t пустой адрес, то s ≥ t, разбираем случаи.
+  ; 2. Если t не пустой, то пустой s < t.
+  ; 3. Сравниваем первые компоненты имён.
+  ;   3.1. (car s) < (car t) → #:less
+  ;   3.2. (car s) > (car t) → #:greater
+  ;   3.3. (car s) = (car t) → сравнение оставшихся хвостов
+  (cond ((null? t) (if (null? s) #:equal #:greater))
+        ((null? s) #:less)
+        (else (string-compare (car s) (car t)
+                              (const #:less)
+                              (lambda A (fqdn-compare (cdr s) (cdr t)))
+                              (const #:greater)))))
+
+(define (fqdn>? s t) (eqv? #:greater (fqdn-compare s t)))
+(define (fqdn=? s t) (eqv? #:equal (fqdn-compare s t)))
+(define (fqdn<? s t) (eqv? #:less (fqdn-compare s t)))
+
+; ЧТЕНИЕ НЕОБХОДИМЫХ ДАННЫХ О СЕРТИФИКАТАХ
 
 (define (certificate-subjects text)
   (unique (fold (lambda (s R)
@@ -73,12 +81,6 @@
                 text)
           fqdn<?
           fqdn=?))
-
-; Вспомогательные процедуры вывода сообщений об ошибках. Возвращают значения,
-; примерно соответствующие необходимой логике программы.
-
-(define (warn fmt . args) (apply dump (string-append "WARNING: " fmt) args) #f)
-(define (ignore fmt . args) (apply dump (string-append "IGNORING: " fmt) args) '())
  
 ; Беда: Guile не умеет понимать строковые обозначения временных зон. Поэтому
 ; надо извлечь обозначение временной зоны, убедиться что это GMT или UTC, и
@@ -98,7 +100,12 @@
   (let ((l (fix-timezone s)))
     (and l (date->time-utc (string->date l "notAfter=~b~d~H:~M:~S~Y~z"))))) 
  
-(define (read-key cert)
+; Примерно такой вот у нас формат прочитанных сертификатов
+(define x509:file caar)
+(define x509:expire cdar)
+(define x509:subjects cdr)
+ 
+(define (read-certificate cert)
   (catch 
     #t
     (lambda ()
@@ -110,12 +117,12 @@
              (S (and (pair? L) (certificate-subjects (cdr L)))))
         (if (and (time? t)
                  (populated? S))
-          (map (lambda (s) (cons* cert t s)) S)
+          (cons (cons cert t) S)
           (ignore "lack of data: ~a: ~s ~s~%" cert t S))))
     (lambda err
       (ignore "error: ~a: ~s~%" cert err))))
 
-(define pem-vector
+(define read-certificate-directory
   (let ((pass (lambda (path stat result) result))
         (fail (lambda (path stat errno result)
                 (warn "~a: ~a~%" path (strerror errno))
@@ -127,27 +134,67 @@
                   (begin (warn "~a: not a regular .pem file~%" path)
                          result)))))
     (lambda (directory)
-      (list->vector
-        (file-system-fold
-          ; Заходить директорию? 
-          (const #t)
+      (let ((pems (file-system-fold
+                    ; Заходить директорию? 
+                    (const #t)
 
-          ; Обработка записей в директориях.
-          leaf
+                    ; Обработка записей в директориях.
+                    leaf
 
-          ; Действия на входе из неё, на выходе, при её пропуске.
-          pass
-          pass
-          pass
+                    ; Действия на входе из неё, на выходе, при её пропуске.
+                    pass
+                    pass
+                    pass
 
-          ; Обработка ошибок.
-          fail
+                    ; Обработка ошибок.
+                    fail
 
-          '()
-          (canonicalize-path directory)
+                    '()
+                    (canonicalize-path directory)
 
-          ; Проходить по символическим ссылкам.
-          stat)))))
+                    ; Проходить по символическим ссылкам.
+                    stat))) 
+        (par-map read-certificate pems)))))
+
+; ВЫВОД ИНФОРМАЦИИ О СЕРТИФИКАТЕ
+
+(define (dump-certificate c)
+  (dump "~%~/~a~%~/~/expiration date: ~a~%~/~/subjects: ~a~%"
+        (x509:file c)
+        (date->string (time-utc->date (x509:expire c)))
+        (string-join (map fqdn->string (x509:subjects c)) " ")))
+
+; ОБРАБОТКА СЕРТИФИКАТОВ
+
+(define filter-expired
+  (let* ((today (date->time-utc (current-date)))
+         (expired? (lambda (c) (time>=? today (x509:expire c)))))
+    (lambda (C)
+      (partition expired? C))))
+
+(define certificate-directory
+  (let* ((cl (command-line))
+         (len (length cl))
+         (path (or (and (= 2 len) (second cl))
+                   (and (<= 3 len) (third cl)))))
+    (if (and path
+             (absolute-file-name? path)
+             (file-exists? path)
+             (file-is-directory? path))
+      path
+      (begin (dump "ERROR: expecting absolute dir path: ~s~%" cl)
+             (exit 1)))))
+
+; ЛОГИКА ВЕРХНЕГО УРОВНЯ
+
+(let*-values (((C) (read-certificate-directory certificate-directory))
+              ((expired valid) (filter-expired C)))
+  (when (populated? expired)
+    (dump "EXPIRED:")
+    (for-each dump-certificate expired)
+    (dump "~%")))
+
+(exit 0) 
 
 (define (read-key-directory directory)
   (concatenate (par-map read-key (vector->list (pem-vector directory)))))
@@ -170,18 +217,7 @@
                               (expiration-date l))
                         #t)))))
 
-(define key-directory
-  (let* ((cl (command-line))
-         (len (length cl))
-         (path (or (and (= 2 len) (second cl))
-                   (and (<= 3 len) (third cl)))))
-    (if (and path
-             (absolute-file-name? path)
-             (file-exists? path)
-             (file-is-directory? path))
-      path
-      (begin (dump "ERROR: expecting absolute dir path: ~s~%" cl)
-             (exit 1)))))
+
 
 (define (light-echo p)
   (format #t "$HTTP[\"host\"] == ~s {~%~/ssl.pemfile = ~s # ~s~%}~%~%"
@@ -211,10 +247,8 @@
               (else (dump "ERROR: unknown server: ~s~%" name)
                     (exit 1)))))))
 
-(define key-records (only-fresh (read-key-directory key-directory)))
 
-; (for-each write-line key-records)
-; (exit 0)
+(define key-records (only-fresh (read-key-directory key-directory)))
 
 ; По идее, сравнения по указателям должны работать.
 (let ((len (length key-records)))
