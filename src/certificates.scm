@@ -3,6 +3,9 @@
              (ice-9 rdelim)
              (ice-9 ftw)
              (ice-9 threads)
+             (ice-9 getopt-long)
+             (ice-9 vlist)
+             (ice-9 match)
              (srfi srfi-1)
              (srfi srfi-11)
              (srfi srfi-19)
@@ -42,6 +45,8 @@
       (fold (lambda (x R) (if (same? (car R) x) R (cons x R)))
             (list (car S))
             (cdr S)))))
+
+(define (of-strings . S) (lambda (s) (member s S string=?)))
 
 ; ПРОЦЕДУРЫ ДЛЯ РАБОТЫ С FQDN ВО ВНУТРЕННЕМ ФОРМАТЕ
 
@@ -88,14 +93,15 @@
 ; заменить его на +0000. Ожидается, что зоны обозначены словом из заглавных
 ; букв и записаны в конце.
 
-(define zone-re (make-regexp "[A-Z]+$"))
-
-(define (fix-timezone s)
-  (let ((m (regexp-exec zone-re s)))
-    (if (and (regexp-match? m)
-             (member (match:substring m) '("GMT" "UTC") string=?))
-      (string-append (match:prefix m) "+0000")
-      (warn "Unexpected timezone: ~s~%" s))))
+(define fix-timezone 
+  (let ((zone-re (make-regexp "[A-Z]+$"))
+        (expected-zone? (of-strings "GMT" "UTC")))
+    (lambda (s)
+      (let ((m (regexp-exec zone-re s)))
+        (if (and (regexp-match? m)
+                 (expected-zone? (match:substring m)))
+          (string-append (match:prefix m) "+0000")
+          (warn "Unexpected timezone: ~s~%" s))))))
 
 (define (expiration-time s)
   (let ((l (fix-timezone s)))
@@ -181,21 +187,6 @@
                '()
                V))
 
-; (define (only-fresh keys)
-;   (unique keys
-;           (lambda (k l)
-;             (case (fqdn-compare (subject k) (subject l))
-;               ((#:less) #f)
-;               ((#:greater) #t)
-;               ((#:equal) (time>? (expire k) (expire l)))))
-;           (lambda (k l)
-;             (and (fqdn=? (subject k) (subject l))
-;                  (begin (warn "ignoring outdated: ~a: ~a: ~a~%"
-;                               (key l)
-;                               (subject-url l)
-;                               (expiration-date l))
-;                         #t)))))
-
 (define (select-actual C)
   (let* ((V (list->vector C))
          (U (make-bitvector (vector-length V)))
@@ -232,7 +223,96 @@
                          '()
                          V))))
 
+(define (separate-certificates directory)
+  (let*-values (((C) (read-certificate-directory directory))
+                ((valid expired) (filter-expired C))
+                ((actual outdated) (select-actual valid)))
+    (when (populated? expired)
+      (dump "EXPIRED:")
+      (for-each dump-certificate expired)
+      (dump "~%"))
+    (when (populated? outdated)
+      (dump "OUTDATED:")
+      (for-each dump-certificate outdated)
+      (dump "~%"))
+    (values actual outdated expired)))
+
+; РАЗБОР ПАРАМЕТРОВ КОМАНДНОЙ СТРОКИ
+
+(define usage
+  (let* ((s "certificates.scm ")
+         (n (string-length s))
+         (f (string-join '("~a[-p path]"
+                           "[-c nginx | lighttpd]"
+                           "[-d expired | outdated | both]"
+                           "[-h]~%")
+                         "~%~1@*~v_")))
+    (lambda () (dump f s n))))
+
+; FIXME: Вообще, идея сделать общих хэш с параметрами на все вызовы
+; parse-command-line не кажется такой уж и плохой. Видимость локальная, пусть
+; пока будет.
+(define parse-command-line
+  (let* ((H (make-hash-table))
+
+         (spec '((help (single-char #\h))
+                 (path (single-char #\p) (value #t))
+                 (delete (single-char #\d) (value #t))
+                 (configure (single-char #\c) (value #t))))
+
+
+
+         (collect (lambda (key valid? msg item)
+                    (if (not (valid? item))
+                      (begin (dump "~a: ~s~%" msg item)
+                             (throw 'quit 1))
+                      (let ((I (hashq-ref H key)))
+                        (if (not (list? I))
+                          (error "Invalid option key: ~s~%" key)
+                          (or (member item I string=?)
+                              (hashq-set! H key (cons item I))))))))
+
+         (engine? (of-strings "nginx" "lighttpd"))
+         (mode? (of-strings "both" "expired" "outdated"))
+         (path? (lambda (p) (and (absolute-file-name? p)
+                                 (file-exists? p)
+                                 (file-is-directory? p))))
+
+         (kv (match-lambda
+               (('() . I) (when (populated? I)
+                            (dump "unexpected command-line items: ~s~%" I)
+                            (throw 'quit 1)))
+
+               (('help . #t) (throw 'quit 1))
+
+               (('path . p) (collect 'path path?
+                                     "not an absolute directory path" p))
+
+               (('delete . m) (collect 'mode mode? "unknown erase mode " m))
+
+               (('configure . e) (collect 'engine engine?
+                                          "unknown configuration engine" e)))))
+    (lambda (cl)
+      (hashq-set! H 'path '())
+      (hashq-set! H 'mode '())
+      (hashq-set! H 'engine '())
+
+      (catch 'quit
+             (lambda () (for-each kv (getopt-long cl spec)))
+             (lambda err (usage) (exit 1)))
+
+      (values (hashq-ref H 'path)
+              (hashq-ref H 'mode)
+              (hashq-ref H 'engine)))))
+
 ; ЛОГИКА ВЕРХНЕГО УРОВНЯ
+
+(let-values (((paths modes engines) (parse-command-line (command-line))))
+  (write-line paths)
+  (write-line modes)
+  (write-line engines))
+
+(exit 0)
 
 (define certificate-directory
   (let* ((cl (command-line))
@@ -247,42 +327,25 @@
       (begin (dump "ERROR: expecting absolute dir path: ~s~%" cl)
              (exit 1)))))
 
-(let*-values (((C) (read-certificate-directory certificate-directory))
-              ((valid expired) (filter-expired C))
-              ((actual outdated) (select-actual valid)))
-
-;   (for-each write-line actual)
-;   (write-line outdated)
-
-  (when (populated? expired)
-    (dump "EXPIRED:")
-    (for-each dump-certificate expired)
-    (dump "~%"))
-
-  (when (populated? outdated)
-    (dump "OUTDATED:")
-    (for-each dump-certificate outdated)
-    (dump "~%")))
-
 (exit 0) 
 
-(define expiration-date (compose date->string time-utc->date expire))
-(define subject-url (compose fqdn->string subject))
+; (define expiration-date (compose date->string time-utc->date expire))
+; (define subject-url (compose fqdn->string subject))
 
-(define (only-fresh keys)
-  (unique keys
-          (lambda (k l)
-            (case (fqdn-compare (subject k) (subject l))
-              ((#:less) #f)
-              ((#:greater) #t)
-              ((#:equal) (time>? (expire k) (expire l)))))
-          (lambda (k l)
-            (and (fqdn=? (subject k) (subject l))
-                 (begin (warn "ignoring outdated: ~a: ~a: ~a~%"
-                              (key l)
-                              (subject-url l)
-                              (expiration-date l))
-                        #t)))))
+; (define (only-fresh keys)
+;   (unique keys
+;           (lambda (k l)
+;             (case (fqdn-compare (subject k) (subject l))
+;               ((#:less) #f)
+;               ((#:greater) #t)
+;               ((#:equal) (time>? (expire k) (expire l)))))
+;           (lambda (k l)
+;             (and (fqdn=? (subject k) (subject l))
+;                  (begin (warn "ignoring outdated: ~a: ~a: ~a~%"
+;                               (key l)
+;                               (subject-url l)
+;                               (expiration-date l))
+;                         #t)))))
 
 (define (light-echo p)
   (format #t "$HTTP[\"host\"] == ~s {~%~/ssl.pemfile = ~s # ~s~%}~%~%"
