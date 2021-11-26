@@ -5,7 +5,8 @@
              (ice-9 threads)
              (srfi srfi-1)
              (srfi srfi-11)
-             (srfi srfi-19))
+             (srfi srfi-19)
+             (srfi srfi-43))
 
 ; OpenSSL не учитывает текущую locale (место действия). Приспосабливаемся
 (setlocale LC_ALL "en_US.UTF-8")
@@ -79,7 +80,7 @@
                                   (cons (string->fqdn (match:substring m)) M))))
                 '()
                 text)
-          fqdn<?
+          fqdn>?
           fqdn=?))
  
 ; Беда: Guile не умеет понимать строковые обозначения временных зон. Поэтому
@@ -168,9 +169,70 @@
 
 (define filter-expired
   (let* ((today (date->time-utc (current-date)))
-         (expired? (lambda (c) (time>=? today (x509:expire c)))))
+         (active? (lambda (c) (time<? today (x509:expire c)))))
     (lambda (C)
-      (partition expired? C))))
+      (partition active? C))))
+
+(define (list-subjects V)
+  (vector-fold (lambda (i R certificate)
+                 (append-reverse
+                   (map (lambda (c) (cons i c)) (x509:subjects certificate))
+                   R))
+               '()
+               V))
+
+; (define (only-fresh keys)
+;   (unique keys
+;           (lambda (k l)
+;             (case (fqdn-compare (subject k) (subject l))
+;               ((#:less) #f)
+;               ((#:greater) #t)
+;               ((#:equal) (time>? (expire k) (expire l)))))
+;           (lambda (k l)
+;             (and (fqdn=? (subject k) (subject l))
+;                  (begin (warn "ignoring outdated: ~a: ~a: ~a~%"
+;                               (key l)
+;                               (subject-url l)
+;                               (expiration-date l))
+;                         #t)))))
+
+(define (select-actual C)
+  (let* ((V (list->vector C))
+         (U (make-bitvector (vector-length V)))
+         (subject cdr)
+         (expire (lambda (s) (x509:expire (vector-ref V (car s)))))
+
+         ; Расставляем ключи так, чтобы для одного subject сначала встречались
+         ; более свежие сертификаты
+         (less? (lambda (k l)
+                  (case (fqdn-compare (subject k) (subject l))
+                    ((#:less) #f)
+                    ((#:greater) #t)
+                    ((#:equal) (time>? (expire k) (expire l)))
+                    (else (error "Ordering nonsense:" k l)))))
+
+         ; Тест на равенство subject. Дополнительно отмечает сертификат с
+         ; впервые встретившимся subject в векторе U (used). ВАЖНО: из-за
+         ; особенностей unique первый элемент списка не встретится на втором
+         ; месте при вызове same? Нужно отметить этот элемент дополнительно.
+         (same? (lambda (k l) 
+                  (or (fqdn=? (subject k) (subject l))
+                      (begin (bitvector-set! U (car l) #t) #f))))
+
+         (A (unique (list-subjects V) less? same?)))
+
+    ; Поправка к same?
+    (when (populated? A) (bitvector-set! U (car (car A)) #t))
+
+    (values (map (lambda (s) (let ((c (vector-ref V (car s))))
+                               (cons* (x509:file c) (x509:expire c) (cdr s))))
+                 A)
+            ; В этом списке неиспользуемые сертификаты, для которых (U i) = #f
+            (vector-fold (lambda (i R c) (if (bitvector-ref U i) R (cons c R)))
+                         '()
+                         V))))
+
+; ЛОГИКА ВЕРХНЕГО УРОВНЯ
 
 (define certificate-directory
   (let* ((cl (command-line))
@@ -185,19 +247,24 @@
       (begin (dump "ERROR: expecting absolute dir path: ~s~%" cl)
              (exit 1)))))
 
-; ЛОГИКА ВЕРХНЕГО УРОВНЯ
-
 (let*-values (((C) (read-certificate-directory certificate-directory))
-              ((expired valid) (filter-expired C)))
+              ((valid expired) (filter-expired C))
+              ((actual outdated) (select-actual valid)))
+
+;   (for-each write-line actual)
+;   (write-line outdated)
+
   (when (populated? expired)
     (dump "EXPIRED:")
     (for-each dump-certificate expired)
+    (dump "~%"))
+
+  (when (populated? outdated)
+    (dump "OUTDATED:")
+    (for-each dump-certificate outdated)
     (dump "~%")))
 
 (exit 0) 
-
-(define (read-key-directory directory)
-  (concatenate (par-map read-key (vector->list (pem-vector directory)))))
 
 (define expiration-date (compose date->string time-utc->date expire))
 (define subject-url (compose fqdn->string subject))
@@ -216,8 +283,6 @@
                               (subject-url l)
                               (expiration-date l))
                         #t)))))
-
-
 
 (define (light-echo p)
   (format #t "$HTTP[\"host\"] == ~s {~%~/ssl.pemfile = ~s # ~s~%}~%~%"
