@@ -249,68 +249,131 @@
                          "~%~1@*~v_")))
     (lambda () (dump f s n))))
 
-; FIXME: Вообще, идея сделать общих хэш с параметрами на все вызовы
-; parse-command-line не кажется такой уж и плохой. Видимость локальная, пусть
-; пока будет.
+; (define parse-command-line
+;   (let* ((H (make-hash-table))
+; 
+;          (spec '((help (single-char #\h))
+;                  (path (single-char #\p) (value #t))
+;                  (delete (single-char #\d) (value #t))
+;                  (configure (single-char #\c) (value #t))))
+; 
+;          (collect (lambda (key valid? msg item)
+;                     (if (not (valid? item))
+;                       (begin (dump "~a: ~s~%" msg item)
+;                              (throw 'quit 1))
+;                       (let ((I (hashq-ref H key)))
+;                         (if (not (list? I))
+;                           (error "Invalid option key: ~s~%" key)
+;                           (or (member item I string=?)
+;                               (hashq-set! H key (cons item I))))))))
+; 
+;          (engine? (of-strings "nginx" "lighttpd"))
+;          (mode? (of-strings "both" "expired" "outdated"))
+;          (path? (lambda (p) (and (absolute-file-name? p)
+;                                  (file-exists? p)
+;                                  (file-is-directory? p))))
+; 
+;          (kv (match-lambda
+;                (('() . I) (when (populated? I)
+;                             (dump "unexpected command-line items: ~s~%" I)
+;                             (throw 'quit 1)))
+; 
+;                (('help . #t) (throw 'quit 1))
+; 
+;                (('path . p) (collect 'path path?
+;                                      "not an absolute directory path" p))
+; 
+;                (('delete . m) (collect 'mode mode? "unknown erase mode " m))
+; 
+;                (('configure . e) (collect 'engine engine?
+;                                           "unknown configuration engine" e)))))
+;     (lambda (cl)
+;       (hashq-set! H 'path '())
+;       (hashq-set! H 'mode '())
+;       (hashq-set! H 'engine '())
+; 
+;       (catch 'quit
+;              (lambda () (for-each kv (getopt-long cl spec)))
+;              (lambda err (usage) (exit 1)))
+; 
+;       (values (hashq-ref H 'path)
+;               (hashq-ref H 'mode)
+;               (hashq-ref H 'engine)))))
+
 (define parse-command-line
-  (let* ((H (make-hash-table))
+  (let ((spec '((help (single-char #\h))
+                (path (single-char #\p) (value #t))
+                (delete (single-char #\d) (value #t))
+                (configure (single-char #\c) (value #t))))
 
-         (spec '((help (single-char #\h))
-                 (path (single-char #\p) (value #t))
-                 (delete (single-char #\d) (value #t))
-                 (configure (single-char #\c) (value #t))))
+        (kv (lambda (put!)
+              (match-lambda
+                (('() . I) (when (populated? I)
+                             (dump "unexpected command-line items: ~s~%" I)
+                             (throw 'quit 1)))
 
+                (('help . #t) (throw 'quit 1))
 
+                (('path . p) (put! 'path p))
+                (('delete . m) (put! 'mode m))
+                (('configure . e) (put! 'engine e)))))
 
-         (collect (lambda (key valid? msg item)
-                    (if (not (valid? item))
-                      (begin (dump "~a: ~s~%" msg item)
-                             (throw 'quit 1))
-                      (let ((I (hashq-ref H key)))
-                        (if (not (list? I))
-                          (error "Invalid option key: ~s~%" key)
-                          (or (member item I string=?)
-                              (hashq-set! H key (cons item I))))))))
-
-         (engine? (of-strings "nginx" "lighttpd"))
-         (mode? (of-strings "both" "expired" "outdated"))
-         (path? (lambda (p) (and (absolute-file-name? p)
-                                 (file-exists? p)
-                                 (file-is-directory? p))))
-
-         (kv (match-lambda
-               (('() . I) (when (populated? I)
-                            (dump "unexpected command-line items: ~s~%" I)
-                            (throw 'quit 1)))
-
-               (('help . #t) (throw 'quit 1))
-
-               (('path . p) (collect 'path path?
-                                     "not an absolute directory path" p))
-
-               (('delete . m) (collect 'mode mode? "unknown erase mode " m))
-
-               (('configure . e) (collect 'engine engine?
-                                          "unknown configuration engine" e)))))
+        (cons-to-key!
+          (lambda (H)
+            (lambda (key item)
+              (let ((I (hashq-ref H key)))
+                (if (false? I) 
+                  (error "Invalid option key: ~s~%" key)
+                  (hashq-set! H key (cons item I))))))))
     (lambda (cl)
-      (hashq-set! H 'path '())
-      (hashq-set! H 'mode '())
-      (hashq-set! H 'engine '())
+      (let ((H (make-hash-table 3)))
+        (hashq-set! H 'path '())
+        (hashq-set! H 'mode '())
+        (hashq-set! H 'engine '())
 
-      (catch 'quit
-             (lambda () (for-each kv (getopt-long cl spec)))
-             (lambda err (usage) (exit 1)))
+        (catch 'quit
+               (lambda () (for-each (kv (cons-to-key! H)) (getopt-long cl spec)))
+               (lambda err (usage) (exit 1)))
 
-      (values (hashq-ref H 'path)
-              (hashq-ref H 'mode)
-              (hashq-ref H 'engine)))))
+        (values (hashq-ref H 'path)
+                (unique (hashq-ref H 'mode) string>? string=?)
+                (unique (hashq-ref H 'engine) string>? string=?))))))
+
+(define sanitise-options
+  (let ((non-engine? (compose not (of-strings "nginx" "lighttpd")))
+        (non-mode? (compose not (of-strings "both" "expired" "outdated")))
+        (non-path? (compose not (lambda (p) (and (absolute-file-name? p)
+                                                 (file-exists? p)
+                                                 (file-is-directory? p))))))
+
+    (lambda (paths modes engines)
+      (let ((NP (filter non-path? paths))
+            (NM (filter non-mode? modes))
+            (NE (filter non-engine? engines)))
+        (let ((p? (populated? NP))
+              (e? (populated? NE))
+              (m? (populated? NM))
+              (u? (< 1 (length engines))))
+          (when p? (dump "Not absolute directory paths: ~s~%" NP))
+          (when m? (dump "Unknown erase modes: ~s~%" NM))
+          (when e? (dump "Unknown configuration requests: ~s~%" NE))
+
+          (when (and (not e?) u?)
+            (dump "Ambiguous configuration requests: ~s~%" engines))
+
+          (when (or p? m? e? u?) (usage) (exit 1))
+
+          (values (unique (map canonicalize-path paths) string<? string=?)
+                  modes
+                  (car engines)))))))
 
 ; ЛОГИКА ВЕРХНЕГО УРОВНЯ
 
-(let-values (((paths modes engines) (parse-command-line (command-line))))
+(let*-values (((P M E) (parse-command-line (command-line)))
+             ((paths modes engine) (sanitise-options P M E)))
   (write-line paths)
   (write-line modes)
-  (write-line engines))
+  (write-line engine))
 
 (exit 0)
 
@@ -328,24 +391,6 @@
              (exit 1)))))
 
 (exit 0) 
-
-; (define expiration-date (compose date->string time-utc->date expire))
-; (define subject-url (compose fqdn->string subject))
-
-; (define (only-fresh keys)
-;   (unique keys
-;           (lambda (k l)
-;             (case (fqdn-compare (subject k) (subject l))
-;               ((#:less) #f)
-;               ((#:greater) #t)
-;               ((#:equal) (time>? (expire k) (expire l)))))
-;           (lambda (k l)
-;             (and (fqdn=? (subject k) (subject l))
-;                  (begin (warn "ignoring outdated: ~a: ~a: ~a~%"
-;                               (key l)
-;                               (subject-url l)
-;                               (expiration-date l))
-;                         #t)))))
 
 (define (light-echo p)
   (format #t "$HTTP[\"host\"] == ~s {~%~/ssl.pemfile = ~s # ~s~%}~%~%"
@@ -374,7 +419,6 @@
               ((string=? "lighttpd" name) light-echo)
               (else (dump "ERROR: unknown server: ~s~%" name)
                     (exit 1)))))))
-
 
 (define key-records (only-fresh (read-key-directory key-directory)))
 
