@@ -129,39 +129,42 @@
     (lambda err
       (ignore "error: ~a: ~s~%" cert err))))
 
-(define read-certificate-directory
-  (let ((pass (lambda (path stat result) result))
-        (fail (lambda (path stat errno result)
-                (warn "~a: ~a~%" path (strerror errno))
-                result))
-        (leaf (lambda (path stat result)
-                (if (and (eq? 'regular (stat:type stat))
-                         (string-suffix? ".pem" path))
-                  (cons path result)
-                  (begin (warn "~a: not a regular .pem file~%" path)
-                         result)))))
-    (lambda (directory)
-      (let ((pems (file-system-fold
-                    ; Заходить директорию? 
-                    (const #t)
+(define read-certificate-directories
+  (let* ((pass (lambda (path stat result) result))
+         (fail (lambda (path stat errno result)
+                 (warn "~a: ~a~%" path (strerror errno))
+                 result))
+         (leaf (lambda (path stat result)
+                 (if (and (eq? 'regular (stat:type stat))
+                          (string-suffix? ".pem" path))
+                   (cons path result)
+                   (begin (ignore "not a regular .pem file: ~a~%" path)
+                          result))))
+         (pems (lambda (path)
+                 (file-system-fold
+                   ; Заходить директорию? 
+                   (const #t)
 
-                    ; Обработка записей в директориях.
-                    leaf
+                   ; Обработка записей в директориях.
+                   leaf
 
-                    ; Действия на входе из неё, на выходе, при её пропуске.
-                    pass
-                    pass
-                    pass
+                   ; Действия на входе из неё, на выходе, при её пропуске.
+                   pass
+                   pass
+                   pass
 
-                    ; Обработка ошибок.
-                    fail
+                   ; Обработка ошибок.
+                   fail
 
-                    '()
-                    (canonicalize-path directory)
+                   '()
+                   path
 
-                    ; Проходить по символическим ссылкам.
-                    stat))) 
-        (par-map read-certificate pems)))))
+                   ; Проходить по символическим ссылкам.
+                   stat))))
+    (lambda (paths)
+      (let ((C (par-map read-certificate (append-map pems paths))))
+        (dump "LOADED~%")
+        C))))
 
 ; ВЫВОД ИНФОРМАЦИИ О СЕРТИФИКАТЕ
 
@@ -223,15 +226,15 @@
                          '()
                          V))))
 
-(define (separate-certificates directory)
-  (let*-values (((C) (read-certificate-directory directory))
+(define (separate-certificates paths quiet?)
+  (let*-values (((C) (read-certificate-directories paths))
                 ((valid expired) (filter-expired C))
                 ((actual outdated) (select-actual valid)))
-    (when (populated? expired)
+    (when (and (populated? expired) (not quiet?))
       (dump "EXPIRED:")
       (for-each dump-certificate expired)
       (dump "~%"))
-    (when (populated? outdated)
+    (when (and (populated? outdated) (not quiet?))
       (dump "OUTDATED:")
       (for-each dump-certificate outdated)
       (dump "~%"))
@@ -249,60 +252,37 @@
                          "~%~1@*~v_")))
     (lambda () (dump f s n))))
 
-; (define parse-command-line
-;   (let* ((H (make-hash-table))
-; 
-;          (spec '((help (single-char #\h))
-;                  (path (single-char #\p) (value #t))
-;                  (delete (single-char #\d) (value #t))
-;                  (configure (single-char #\c) (value #t))))
-; 
-;          (collect (lambda (key valid? msg item)
-;                     (if (not (valid? item))
-;                       (begin (dump "~a: ~s~%" msg item)
-;                              (throw 'quit 1))
-;                       (let ((I (hashq-ref H key)))
-;                         (if (not (list? I))
-;                           (error "Invalid option key: ~s~%" key)
-;                           (or (member item I string=?)
-;                               (hashq-set! H key (cons item I))))))))
-; 
-;          (engine? (of-strings "nginx" "lighttpd"))
-;          (mode? (of-strings "both" "expired" "outdated"))
-;          (path? (lambda (p) (and (absolute-file-name? p)
-;                                  (file-exists? p)
-;                                  (file-is-directory? p))))
-; 
-;          (kv (match-lambda
-;                (('() . I) (when (populated? I)
-;                             (dump "unexpected command-line items: ~s~%" I)
-;                             (throw 'quit 1)))
-; 
-;                (('help . #t) (throw 'quit 1))
-; 
-;                (('path . p) (collect 'path path?
-;                                      "not an absolute directory path" p))
-; 
-;                (('delete . m) (collect 'mode mode? "unknown erase mode " m))
-; 
-;                (('configure . e) (collect 'engine engine?
-;                                           "unknown configuration engine" e)))))
-;     (lambda (cl)
-;       (hashq-set! H 'path '())
-;       (hashq-set! H 'mode '())
-;       (hashq-set! H 'engine '())
-; 
-;       (catch 'quit
-;              (lambda () (for-each kv (getopt-long cl spec)))
-;              (lambda err (usage) (exit 1)))
-; 
-;       (values (hashq-ref H 'path)
-;               (hashq-ref H 'mode)
-;               (hashq-ref H 'engine)))))
+(define purify-options
+  (let ((non-engine? (compose not (of-strings "nginx" "lighttpd")))
+        (non-mode? (compose not (of-strings "both" "expired" "outdated")))
+        (non-path? (compose not (lambda (p) (and (absolute-file-name? p)
+                                                 (file-exists? p)
+                                                 (file-is-directory? p))))))
+    (lambda (paths modes engines flags)
+      (let ((NP (filter non-path? paths))
+            (NM (filter non-mode? modes))
+            (NE (filter non-engine? engines)))
+        (let ((p? (populated? NP))
+              (e? (populated? NE))
+              (m? (populated? NM))
+              (u? (< 1 (length engines))))
+          (when p? (dump "Not absolute directory paths: ~s~%" NP))
+          (when m? (dump "Unknown erase modes: ~s~%" NM))
+          (when e? (dump "Unknown configuration requests: ~s~%" NE))
+          (when (and (not e?) u?)
+            (dump "Ambiguous configuration requests: ~s~%" engines))
+
+          (when (or p? m? e? u?) (usage) (exit 1))
+
+          (values (unique (map canonicalize-path paths) string<? string=?)
+                  modes
+                  (if (null? engines) "" (car engines))
+                  flags))))))
 
 (define parse-command-line
   (let ((spec '((help (single-char #\h))
                 (path (single-char #\p) (value #t))
+                (quiet (single-char #\q))
                 (delete (single-char #\d) (value #t))
                 (configure (single-char #\c) (value #t))))
 
@@ -315,6 +295,7 @@
                 (('help . #t) (throw 'quit 1))
 
                 (('path . p) (put! 'path p))
+                (('quiet . #t) (put! 'flags 'quiet))
                 (('delete . m) (put! 'mode m))
                 (('configure . e) (put! 'engine e)))))
 
@@ -329,68 +310,27 @@
       (let ((H (make-hash-table 3)))
         (hashq-set! H 'path '())
         (hashq-set! H 'mode '())
+        (hashq-set! H 'flags '())
         (hashq-set! H 'engine '())
 
         (catch 'quit
                (lambda () (for-each (kv (cons-to-key! H)) (getopt-long cl spec)))
                (lambda err (usage) (exit 1)))
 
-        (values (hashq-ref H 'path)
-                (unique (hashq-ref H 'mode) string>? string=?)
-                (unique (hashq-ref H 'engine) string>? string=?))))))
+        (purify-options (hashq-ref H 'path)
+                        (unique (hashq-ref H 'mode) string>? string=?)
+                        (unique (hashq-ref H 'engine) string>? string=?)
+                        (unique (hashq-ref H 'flags)
+                                (lambda (s t) (string<? (symbol->string s)
+                                                        (symbol->string t)))
+                                eqv?))))))
 
-(define sanitise-options
-  (let ((non-engine? (compose not (of-strings "nginx" "lighttpd")))
-        (non-mode? (compose not (of-strings "both" "expired" "outdated")))
-        (non-path? (compose not (lambda (p) (and (absolute-file-name? p)
-                                                 (file-exists? p)
-                                                 (file-is-directory? p))))))
-
-    (lambda (paths modes engines)
-      (let ((NP (filter non-path? paths))
-            (NM (filter non-mode? modes))
-            (NE (filter non-engine? engines)))
-        (let ((p? (populated? NP))
-              (e? (populated? NE))
-              (m? (populated? NM))
-              (u? (< 1 (length engines))))
-          (when p? (dump "Not absolute directory paths: ~s~%" NP))
-          (when m? (dump "Unknown erase modes: ~s~%" NM))
-          (when e? (dump "Unknown configuration requests: ~s~%" NE))
-
-          (when (and (not e?) u?)
-            (dump "Ambiguous configuration requests: ~s~%" engines))
-
-          (when (or p? m? e? u?) (usage) (exit 1))
-
-          (values (unique (map canonicalize-path paths) string<? string=?)
-                  modes
-                  (car engines)))))))
 
 ; ЛОГИКА ВЕРХНЕГО УРОВНЯ
 
-(let*-values (((P M E) (parse-command-line (command-line)))
-             ((paths modes engine) (sanitise-options P M E)))
-  (write-line paths)
-  (write-line modes)
-  (write-line engine))
-
-(exit 0)
-
-(define certificate-directory
-  (let* ((cl (command-line))
-         (len (length cl))
-         (path (or (and (= 2 len) (second cl))
-                   (and (<= 3 len) (third cl)))))
-    (if (and path
-             (absolute-file-name? path)
-             (file-exists? path)
-             (file-is-directory? path))
-      path
-      (begin (dump "ERROR: expecting absolute dir path: ~s~%" cl)
-             (exit 1)))))
-
-(exit 0) 
+(define key car)
+(define expiration-date (compose string->date time-utc->date cadr))
+(define subject-url (compose fqdn->string cddr))
 
 (define (light-echo p)
   (format #t "$HTTP[\"host\"] == ~s {~%~/ssl.pemfile = ~s # ~s~%}~%~%"
@@ -399,35 +339,78 @@
           (expiration-date p)))
 
 (define nginx-echo
-  (let ((template
-          (string-append "server { "
-                         "include \"https-proxy.conf\"; "
-                         "server_name ~a; "
-                         "ssl_certificate ~a; "
-                         "ssl_certificate_key ~a; "
-                         "} ")))
+  (let ((template (string-append "server { "
+                                 "include \"https-proxy.conf\"; "
+                                 "server_name ~a; "
+                                 "ssl_certificate ~a; "
+                                 "ssl_certificate_key ~a; "
+                                 "} ")))
     (lambda (p)
-      (format #t template (subject-url p) (key p) (key p)))))
+      (format #t template (subject-url p) (key p) (key p))))) 
 
-(define engine
-  (let* ((cl (command-line))
-         (len (length cl)))
-    (if (<= len 2)
-      nginx-echo
-      (let ((name (second cl)))
-        (cond ((string=? "nginx" name) nginx-echo)
-              ((string=? "lighttpd" name) light-echo)
-              (else (dump "ERROR: unknown server: ~s~%" name)
-                    (exit 1)))))))
+(let*-values (((paths modes engine flags) (parse-command-line (command-line)))
+              ((actual outdated expired) (separate-certificates
+                                           paths
+                                           (memq 'quiet flags)))
+              ((mode?) (apply of-strings modes)))
 
-(define key-records (only-fresh (read-key-directory key-directory)))
+  (when (not (string-null? engine))
+    (let ((len (length actual))
+          (echo (cond ((string=? "nginx" engine) nginx-echo)
+                      ((string=? "lighttpd" engine) light-echo)
+                      (else (error "Unknown echo engine:" engine)))))
+      (when (and (positive? len)
+                 (eq? echo nginx-echo))
+        (format #t
+                "server_names_hash_bucket_size ~a; "
+                (expt 2 (integer-length len))))
+      (for-each echo actual)))
 
-; По идее, сравнения по указателям должны работать.
-(let ((len (length key-records)))
-  (when (and (eq? nginx-echo engine)
-             (positive? len))
-    (format #t
-            "server_names_hash_bucket_size ~a; "
-            (expt 2 (integer-length len)))))
+  (when (or (mode? "both") (mode? "expired"))
+    (dump "REMOVING EXPIRED:~%")
+    (for-each (compose write-line x509:file) expired))
 
-(for-each engine key-records)
+  (when (or (mode? "both") (mode? "outdated"))
+    (dump "REMOVING OUTDATED:~%")
+    (for-each (compose write-line x509:file) outdated)))
+
+(exit 0)
+
+; (define certificate-directory
+;   (let* ((cl (command-line))
+;          (len (length cl))
+;          (path (or (and (= 2 len) (second cl))
+;                    (and (<= 3 len) (third cl)))))
+;     (if (and path
+;              (absolute-file-name? path)
+;              (file-exists? path)
+;              (file-is-directory? path))
+;       path
+;       (begin (dump "ERROR: expecting absolute dir path: ~s~%" cl)
+;              (exit 1)))))
+; 
+; (exit 0) 
+
+
+; (define engine
+;   (let* ((cl (command-line))
+;          (len (length cl)))
+;     (if (<= len 2)
+;       nginx-echo
+;       (let ((name (second cl)))
+;         (cond ((string=? "nginx" name) nginx-echo)
+;               ((string=? "lighttpd" name) light-echo)
+;               (else (dump "ERROR: unknown server: ~s~%" name)
+;                     (exit 1)))))))
+; 
+; (define key-records (only-fresh (read-key-directory key-directory)))
+; 
+; ; По идее, сравнения по указателям должны работать.
+; (let ((len (length key-records)))
+;   (when (and (eq? nginx-echo engine)
+;              (positive? len))
+;     (format #t
+;             "server_names_hash_bucket_size ~a; "
+;             (expt 2 (integer-length len)))))
+; 
+; (for-each engine key-records)
