@@ -1,3 +1,6 @@
+#! /usr/bin/env -S guile -s
+!#
+
 (use-modules (ice-9 regex)
              (ice-9 popen)
              (ice-9 rdelim)
@@ -248,6 +251,7 @@
          (f (string-join '("~a[-p path]"
                            "[-c nginx | lighttpd]"
                            "[-d expired | outdated | both]"
+                           "[-q]"
                            "[-h]~%")
                          "~%~1@*~v_")))
     (lambda () (dump f s n))))
@@ -377,16 +381,14 @@
                 (expt 2 (integer-length len))))
       (for-each echo actual)))
 
-  (when (and (populated? expired)
-             (or expired? both?))
+  (when (and (populated? expired) (or expired? both?))
     (when (not quiet?)
       (dump "REMOVING EXPIRED:~%")
       (for-each echo-file expired)
       (dump "~%"))
     (for-each remove-file expired))
 
-  (when (and (populated? outdated)
-             (or outdated? both?))
+  (when (and (populated? outdated) (or outdated? both?))
     (when (not quiet?)
       (dump "REMOVING OUTDATED:~%")
       (for-each echo-file outdated)

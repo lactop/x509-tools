@@ -1,6 +1,10 @@
 *
 
 !.gitignore
+!README.md
+
+!bin
+!bin/*.scm
 
 !src
 !src/*.scm
