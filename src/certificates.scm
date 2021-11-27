@@ -163,7 +163,7 @@
                    stat))))
     (lambda (paths)
       (let ((C (par-map read-certificate (append-map pems paths))))
-        (dump "LOADED~%")
+        ; (dump "LOADED~%")
         C))))
 
 ; ВЫВОД ИНФОРМАЦИИ О СЕРТИФИКАТЕ
@@ -329,7 +329,7 @@
 ; ЛОГИКА ВЕРХНЕГО УРОВНЯ
 
 (define key car)
-(define expiration-date (compose string->date time-utc->date cadr))
+(define expiration-date (compose date->string time-utc->date cadr))
 (define subject-url (compose fqdn->string cddr))
 
 (define (light-echo p)
@@ -348,11 +348,22 @@
     (lambda (p)
       (format #t template (subject-url p) (key p) (key p))))) 
 
+(define (echo-file s) (dump "~/~a~%" (x509:file s)))
+
+(define (remove-file s)
+  (catch 'system-error
+         (lambda () (delete-file (x509:file s)))
+         (lambda err (warn "cannot unlink: ~a: ~a~%"
+                           (strerror (system-error-errno err))
+                           (x509:file s)))))
+
 (let*-values (((paths modes engine flags) (parse-command-line (command-line)))
-              ((actual outdated expired) (separate-certificates
-                                           paths
-                                           (memq 'quiet flags)))
-              ((mode?) (apply of-strings modes)))
+              ((mode? quiet?) (values (apply of-strings modes)
+                                      (memq 'quiet flags)))
+              ((actual outdated expired) (separate-certificates paths quiet?))
+              ((both? expired? outdated?) (values (mode? "both")
+                                                  (mode? "expired")
+                                                  (mode? "outdated"))))
 
   (when (not (string-null? engine))
     (let ((len (length actual))
@@ -366,51 +377,19 @@
                 (expt 2 (integer-length len))))
       (for-each echo actual)))
 
-  (when (or (mode? "both") (mode? "expired"))
-    (dump "REMOVING EXPIRED:~%")
-    (for-each (compose write-line x509:file) expired))
+  (when (and (populated? expired)
+             (or expired? both?))
+    (when (not quiet?)
+      (dump "REMOVING EXPIRED:~%")
+      (for-each echo-file expired)
+      (dump "~%"))
+    (for-each remove-file expired))
 
-  (when (or (mode? "both") (mode? "outdated"))
-    (dump "REMOVING OUTDATED:~%")
-    (for-each (compose write-line x509:file) outdated)))
+  (when (and (populated? outdated)
+             (or outdated? both?))
+    (when (not quiet?)
+      (dump "REMOVING OUTDATED:~%")
+      (for-each echo-file outdated)
+      (dump "~%"))
+    (for-each remove-file outdated)))
 
-(exit 0)
-
-; (define certificate-directory
-;   (let* ((cl (command-line))
-;          (len (length cl))
-;          (path (or (and (= 2 len) (second cl))
-;                    (and (<= 3 len) (third cl)))))
-;     (if (and path
-;              (absolute-file-name? path)
-;              (file-exists? path)
-;              (file-is-directory? path))
-;       path
-;       (begin (dump "ERROR: expecting absolute dir path: ~s~%" cl)
-;              (exit 1)))))
-; 
-; (exit 0) 
-
-
-; (define engine
-;   (let* ((cl (command-line))
-;          (len (length cl)))
-;     (if (<= len 2)
-;       nginx-echo
-;       (let ((name (second cl)))
-;         (cond ((string=? "nginx" name) nginx-echo)
-;               ((string=? "lighttpd" name) light-echo)
-;               (else (dump "ERROR: unknown server: ~s~%" name)
-;                     (exit 1)))))))
-; 
-; (define key-records (only-fresh (read-key-directory key-directory)))
-; 
-; ; По идее, сравнения по указателям должны работать.
-; (let ((len (length key-records)))
-;   (when (and (eq? nginx-echo engine)
-;              (positive? len))
-;     (format #t
-;             "server_names_hash_bucket_size ~a; "
-;             (expt 2 (integer-length len)))))
-; 
-; (for-each engine key-records)
