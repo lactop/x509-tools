@@ -1,4 +1,4 @@
-#! /usr/bin/env -S guile -s
+#! /usr/bin/env guile
 !#
 
 (use-modules (ice-9 regex)
@@ -28,8 +28,13 @@
 ; Вспомогательные процедуры вывода сообщений об ошибках. Возвращают значения,
 ; примерно соответствующие необходимой логике программы.
 
-(define (warn fmt . args) (apply dump (string-append "WARNING: " fmt) args) #f)
-(define (ignore fmt . args) (apply dump (string-append "IGNORING: " fmt) args) '()) 
+(define (warn fmt . args)
+  (apply dump (string-append "WARNING: " fmt) args)
+  #f)
+
+(define (ignore fmt . args)
+  (apply dump (string-append "IGNORING: " fmt) args)
+  #f) 
 
 (define (false? v) (and (boolean? v) (not v)))
 (define (populated? l) (positive? (length l)))
@@ -58,8 +63,6 @@
 (define (string->fqdn s) (reverse (string-split s #\.)))
 (define (fqdn->string n) (string-join (reverse n) ".")) 
 
-(define fqdn-re (make-regexp "[0-9a-z-]+(\\.[0-9a-z-]+)+"))
-
 ; Сравнение fqdn (в заданном выше смысле). Возвращает #:less #:equal #:greater
 (define (fqdn-compare s t)
   ; 1. Если t пустой адрес, то s ≥ t, разбираем случаи.
@@ -81,15 +84,22 @@
 
 ; ЧТЕНИЕ НЕОБХОДИМЫХ ДАННЫХ О СЕРТИФИКАТАХ
 
-(define (certificate-subjects text)
-  (unique (fold (lambda (s R)
-                  (fold-matches fqdn-re s R
-                                (lambda (m M)
-                                  (cons (string->fqdn (match:substring m)) M))))
-                '()
-                text)
-          fqdn>?
-          fqdn=?))
+(define certificate-subjects 
+  (let ((fqdn-re (make-regexp "(^subject=|DNS:)[^0-9a-z-]*([0-9a-z-]+(\\.[0-9a-z-]+)+)"))
+        (domain
+          (lambda (m)
+            ; В совпадении нужна 2 группа + 1 (группа всей строки)
+            (let ((s (vector-ref m 3)))
+              (substring/read-only (match:string m) (car s) (cdr s))))))
+    (lambda (text)
+      (unique (fold (lambda (s R)
+                      (fold-matches fqdn-re s R
+                                    (lambda (m M)
+                                      (cons (string->fqdn (domain m)) M))))
+                    '()
+                    text)
+              fqdn>?
+              fqdn=?))))
  
 ; Беда: Guile не умеет понимать строковые обозначения временных зон. Поэтому
 ; надо извлечь обозначение временной зоны, убедиться что это GMT или UTC, и
@@ -115,22 +125,38 @@
 (define x509:expire cdar)
 (define x509:subjects cdr)
  
-(define (read-certificate cert)
-  (catch 
-    #t
-    (lambda ()
-      (let* ((L (pipe-lines "openssl" "x509" "-noout" "-in" cert
-                            "-enddate"
-                            "-subject"
-                            "-ext" "subjectAltName"))
-             (t (and (pair? L) (expiration-time (car L))))
-             (S (and (pair? L) (certificate-subjects (cdr L)))))
-        (if (and (time? t)
-                 (populated? S))
-          (cons (cons cert t) S)
-          (ignore "lack of data: ~a: ~s ~s~%" cert t S))))
-    (lambda err
-      (ignore "error: ~a: ~s~%" cert err))))
+
+
+(define read-certificate
+  (let ((cert-opt (string-join '("no_subject"
+                                 "no_header"
+                                 "no_version"
+                                 "no_serial"
+                                 "no_signame"
+                                 "no_validity"
+                                 "no_issuer"
+                                 "no_pubkey"
+                                 "no_sigdump"
+                                 "no_aux"
+                                 "ext_error")
+                               ",")))
+    (lambda (cert)
+      (catch 
+        #t
+        (lambda ()
+          (let* ((L (pipe-lines "openssl" "x509" "-noout" "-in" cert
+                                "-enddate"
+                                "-subject"
+                                "-text"
+                                "-certopt" cert-opt))
+                 (t (and (pair? L) (expiration-time (car L))))
+                 (S (and (pair? L) (certificate-subjects (cdr L)))))
+            (if (and (time? t)
+                     (populated? S))
+              (cons (cons cert t) S)
+              (ignore "lack of data: ~a: ~s ~s~%" cert t S))))
+        (lambda err
+          (ignore "error: ~a: ~s~%" cert err))))))
 
 (define read-certificate-directories
   (let* ((pass (lambda (path stat result) result))
@@ -167,7 +193,7 @@
     (lambda (paths)
       (let ((C (par-map read-certificate (append-map pems paths))))
         ; (dump "LOADED~%")
-        C))))
+        (filter identity C)))))
 
 ; ВЫВОД ИНФОРМАЦИИ О СЕРТИФИКАТЕ
 

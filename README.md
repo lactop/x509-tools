@@ -13,7 +13,8 @@ Tools are written in [GNU Guile](https://www.gnu.org/software/guile/) and use
 `openssl` executables must be on one of the `PATH`. Versions
 * GNU Guile 2.0.14
 * OpensSSL 1.0.1t
-will do.
+
+should be sufficeint.
 
 #### certificates.scm
 
