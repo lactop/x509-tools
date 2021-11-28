@@ -14,7 +14,7 @@ Tools are written in [GNU Guile](https://www.gnu.org/software/guile/) and use
 * GNU Guile 2.0.14
 * OpensSSL 1.0.1t
 
-should be sufficeint.
+should be sufficient.
 
 #### certificates.scm
 
@@ -55,10 +55,11 @@ certificates.scm [-p path]
 - `-p` `--path` *path* appends *path* to processed directories. Only files with
   `.pem` extension are taken into account. **WARNING**: certificate in one
   directory may be outdated by certificates in another.
-- `-c` `--configure` *server* requests virtual https hosts configuration for the
-  *server*. Currently only `nginx` and `lighttpd` are supported. The option
-  should be specified once. The resulting configuration is printed to the
-  standard output.
+- `-c` `--configure` *server* requests virtual hosts configuration for the
+  https serving on the *server*. Virtual domain names are extracted from certificates' subjects
+  Currently only `nginx` and `lighttpd` are supported. The option
+  should be specified once. Resulting configuration is printed to the standard
+  output.
 - `-d` `--delete` *set* requests the deletion of `expired` or `outdated` *set*
   of certificates or `both` of them.
 - `-q` `--quiet` makes the program perform silent.
